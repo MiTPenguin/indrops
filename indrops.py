@@ -303,7 +303,7 @@ class IndropsProject():
 
             paths['python'] = os.path.join(paths['python_dir'], 'python')
             paths['java'] = os.path.join(paths['java_dir'], 'java')
-            paths['bowtie'] = os.path.join(paths['bowtie_dir'], 'bowtie')
+            paths['bowtie'] = os.path.join(paths['bowtie_dir'], 'bowtie-align-s')
             paths['samtools'] = os.path.join(paths['samtools_dir'], 'samtools')
             paths['trimmomatic_jar'] = os.path.join(script_dir, 'bins', 'trimmomatic-0.33.jar')
             paths['rsem_tbam2gbam'] = os.path.join(paths['rsem_dir'], 'rsem-tbam2gbam')
@@ -886,7 +886,7 @@ class IndropsLibrary():
         aligned_bam = os.path.join(self.paths.quant_dir, '%s%s.aligned.bam' % (analysis_prefix,barcode))
 
         # Bowtie command
-        bowtie_cmd = [self.project.paths.bowtie, self.project.paths.bowtie_index, '-q', '-',
+        bowtie_cmd = [self.project.paths.bowtie, '--wrapper', 'basic-0', self.project.paths.bowtie_index, '-q', '-',
             '-p', '1', '-a', '--best', '--strata', '--chunkmbs', '1000', '--norc', '--sam',
             '-shmem', #should sometimes reduce memory usage...?
             '-m', str(self.project.parameters['bowtie_arguments']['m']),
@@ -922,31 +922,91 @@ class IndropsLibrary():
         if self.project.parameters['output_arguments']['filter_alignments_to_softmasked_regions']:
             quant_cmd += ['--soft-masked-regions', self.project.paths.bowtie_index + '.soft_masked_regions.pickle']
 
-        # Spawn processes
-
-        p1 = subprocess.Popen(bowtie_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        p2 = subprocess.Popen(quant_cmd, stdin=p1.stdout, stderr=subprocess.PIPE)
+        # Use threading to avoid subprocess deadlock
+        import threading
+        import Queue as queue
         
-                
-        for line in self.get_reads_for_barcode(barcode, run_filter=run_filter):
+        # Spawn bowtie process
+        p1 = subprocess.Popen(bowtie_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        
+        # Create a queue to pass bowtie output to quantification
+        output_queue = queue.Queue()
+        
+        def read_bowtie_output():
+            """Read bowtie output and put it in queue"""
             try:
-                p1.stdin.write(line)
-            except IOError as e:
-                print_to_stderr('\n')
-                print_to_stderr(p1.stderr.read())
-                raise Exception('\n === Error on piping data to bowtie ===')
-
-
-        p1.stdin.close()
-
-        if p1.wait() != 0:
+                for line in iter(p1.stdout.readline, b''):
+                    output_queue.put(line)
+                output_queue.put(None)  # Signal end of output
+            except Exception as e:
+                output_queue.put(e)
+        
+        # Start thread to read bowtie output
+        reader_thread = threading.Thread(target=read_bowtie_output)
+        reader_thread.daemon = True
+        reader_thread.start()
+        
+        # Spawn quantification process
+        p2 = subprocess.Popen(quant_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        def write_to_quantification():
+            """Write bowtie output to quantification process"""
+            try:
+                while True:
+                    line = output_queue.get()
+                    if line is None:  # End of output
+                        break
+                    if isinstance(line, Exception):
+                        raise line
+                    p2.stdin.write(line)
+                p2.stdin.close()
+            except Exception as e:
+                print_to_stderr('Error writing to quantification: %s' % str(e))
+        
+        # Start thread to write to quantification
+        writer_thread = threading.Thread(target=write_to_quantification)
+        writer_thread.daemon = True
+        writer_thread.start()
+        
+        try:
+            # Write all reads to bowtie
+            for line in self.get_reads_for_barcode(barcode, run_filter=run_filter):
+                try:
+                    p1.stdin.write(line)
+                    p1.stdin.flush()
+                except IOError as e:
+                    if e.errno == 32:  # Broken pipe
+                        print_to_stderr('Bowtie terminated early (broken pipe)')
+                        break
+                    else:
+                        raise
+            
+            # Close stdin to signal EOF to bowtie
+            p1.stdin.close()
+            
+        except IOError as e:
             print_to_stderr('\n')
-            print_to_stderr(p1.stderr.read())
-            raise Exception('\n === Error on bowtie ===')
+            print_to_stderr('IOError: %s' % str(e))
+            print_to_stderr('Bowtie stderr: %s' % p1.stderr.read())
+            raise Exception('\n === Error on piping data to bowtie ===')
 
-        if p2.wait() != 0:
+        # Wait for bowtie to finish
+        bowtie_exit = p1.wait()
+        if bowtie_exit != 0:
+            print_to_stderr('\n')
+            print_to_stderr('Bowtie stderr: %s' % p1.stderr.read())
+            raise Exception('\n === Error on bowtie (exit code: %d) ===' % bowtie_exit)
+
+        # Wait for threads to finish
+        reader_thread.join(timeout=30)
+        writer_thread.join(timeout=30)
+        
+        # Wait for quantification to finish
+        quant_exit = p2.wait()
+        if quant_exit != 0:
             print_to_stderr(p2.stderr.read())
-            raise Exception('\n === Error on Quantification Script ===')
+            raise Exception('\n === Error on Quantification Script (exit code: %d) ===' % quant_exit)
+        
         print_to_stderr(p2.stderr.read(), False)
 
         if no_bam:
@@ -1135,14 +1195,14 @@ class LibrarySequencingPart():
     @property
     def part_barcode_counts(self):
         if not hasattr(self, '_part_barcode_counts'):
-            with open(self.barcode_counts_pickle_filename, 'r') as f:
+            with open(self.barcode_counts_pickle_filename) as f:
                 self._part_barcode_counts = pickle.load(f)
         return self._part_barcode_counts
 
     @property
     def sorted_index(self):
         if not hasattr(self, '_sorted_index'):
-            with open(self.sorted_gzipped_fastq_index_filename, 'r') as f:
+            with open(self.sorted_gzipped_fastq_index_filename) as f:
                 self._sorted_index = pickle.load(f)
         return self._sorted_index
 
